@@ -7,6 +7,8 @@ PdfCraft Viewer opens PDFs in [PdfCraft](https://getartcraft.com/apps/pdfcraft) 
 > **Mobile status:** PdfCraft Viewer is off on Obsidian mobile by default. You can enable it in settings, but PdfCraft still needs more development for reliable mobile and touch support.
 
 > **Snappier scrolling:** in PdfCraft, open the menu, choose **Edit → Preferences**, then change the page layout to **Single page**. This is my recommended layout for smoother page-by-page navigation.
+>
+> **Recommended default workspace mode**: in PdfCraft, open the menu, choose **Edit → Preferences** amd select default workspace mode to read.
 
 ## Install from a release
 
