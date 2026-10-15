@@ -653,6 +653,17 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       }
     });
     this.addCommand({
+      id: "open-current-pdf-with-default-app",
+      name: "Open current PDF with default app",
+      checkCallback: (checking) => {
+        if (!import_obsidian.Platform.isDesktopApp || !import_obsidian.Platform.isWin) return false;
+        const leaf = this.app.workspace.activeLeaf;
+        if (!this.pdfFileInLeaf(leaf)) return false;
+        if (!checking) void this.openInDefaultApp(leaf);
+        return true;
+      }
+    });
+    this.addCommand({
       id: "download-latest",
       name: "Download latest PdfCraft web build",
       callback: () => void this.downloadLatest()
@@ -689,7 +700,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
   onunload() {
     this.disposed = true;
     if (this.preloadTimer !== null) window.clearTimeout(this.preloadTimer);
-    for (const button of this.nativeActions.values()) button.remove();
+    for (const buttons of this.nativeActions.values()) buttons.forEach((button) => button.remove());
     this.nativeActions.clear();
     delete window.__pdfcraftForwardKey;
     if (this.tookOver) this.applyTakeover(false);
@@ -782,12 +793,60 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       new import_obsidian.Notice("Could not switch PDF viewer. Try reopening the PDF.");
     }
   }
+  async openInDefaultApp(leaf) {
+    if (!import_obsidian.Platform.isDesktopApp || !import_obsidian.Platform.isWin) return;
+    const file = this.pdfFileInLeaf(leaf);
+    if (!file) return;
+    const view = leaf.view;
+    if (view instanceof PdfCraftView && view.dirty) {
+      if (!this.settings.autoSave || this.settings.saveMode !== "overwrite") {
+        new import_obsidian.Notice("Save your PdfCraft changes before opening this PDF in an external app.");
+        return;
+      }
+      if (!await view.flushAutoSaveBeforeClose()) return;
+    }
+    const adapter = this.app.vault.adapter;
+    if (!(adapter instanceof import_obsidian.FileSystemAdapter)) {
+      new import_obsidian.Notice("Opening in the default app is available only for local Windows vaults.");
+      return;
+    }
+    try {
+      const { spawn } = require("node:child_process");
+      const { Buffer } = require("node:buffer");
+      const fullPath = adapter.getFullPath(file.path);
+      const path64 = Buffer.from(fullPath, "utf16le").toString("base64");
+      const script = `$ErrorActionPreference='Stop'; $pdf=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${path64}')); Start-Process -FilePath $pdf`;
+      const command64 = Buffer.from(script, "utf16le").toString("base64");
+      const child = spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", command64], {
+        windowsHide: true,
+        stdio: ["ignore", "ignore", "pipe"]
+      });
+      let errorText = "";
+      let launchFailed = false;
+      child.stderr.on("data", (chunk) => {
+        if (errorText.length < 2e3) errorText += String(chunk).slice(0, 2e3 - errorText.length);
+      });
+      child.on("error", (error) => {
+        launchFailed = true;
+        console.error("PdfCraft Viewer: could not open PDF in default app", error);
+        new import_obsidian.Notice("Could not open the PDF in the default app.");
+      });
+      child.on("close", (code) => {
+        if (launchFailed || code === 0) return;
+        console.error("PdfCraft Viewer: default PDF app launch failed", errorText || `Exit code ${code}`);
+        new import_obsidian.Notice("Could not open the PDF in the default app.");
+      });
+    } catch (error) {
+      console.error("PdfCraft Viewer: could not open PDF in default app", error);
+      new import_obsidian.Notice("Could not open the PDF in the default app.");
+    }
+  }
   refreshNativeActions() {
     if (this.disposed) return;
     const views = new Set(this.enabledHere ? this.app.workspace.getLeavesOfType("pdf").map((leaf) => leaf.view) : []);
-    for (const [view, button] of this.nativeActions) {
-      if (!views.has(view) || !button.isConnected) {
-        button.remove();
+    for (const [view, buttons] of this.nativeActions) {
+      if (!views.has(view) || buttons.some((button) => !button.isConnected)) {
+        buttons.forEach((button) => button.remove());
         this.nativeActions.delete(view);
       }
     }
@@ -797,7 +856,15 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
         const button = view.addAction("refresh-cw", "Open in PdfCraft", () => void this.switchLeafViewer(view.leaf));
         if (!button) continue;
         button.setAttribute("aria-label", "Open in PdfCraft");
-        this.nativeActions.set(view, button);
+        const buttons = [button];
+        if (import_obsidian.Platform.isDesktopApp && import_obsidian.Platform.isWin) {
+          const defaultApp = view.addAction("file-output", "Open with default PDF app", () => void this.openInDefaultApp(view.leaf));
+          if (defaultApp) {
+            defaultApp.setAttribute("aria-label", "Open with default PDF app");
+            buttons.push(defaultApp);
+          }
+        }
+        this.nativeActions.set(view, buttons);
       } catch (error) {
         console.warn("PdfCraft Viewer: could not add PDF switch button", error);
       }
@@ -1073,7 +1140,12 @@ var PdfCraftView = class extends import_obsidian.FileView {
   }
   async onOpen() {
     await super.onOpen();
-    this.addAction("refresh-cw", "Open in Obsidian PDF viewer", () => void this.plugin.switchLeafViewer(this.leaf));
+    const switchButton = this.addAction("refresh-cw", "Open in Obsidian PDF viewer", () => void this.plugin.switchLeafViewer(this.leaf));
+    switchButton?.setAttribute("aria-label", "Open in Obsidian PDF viewer");
+    if (import_obsidian.Platform.isDesktopApp && import_obsidian.Platform.isWin) {
+      const defaultApp = this.addAction("file-output", "Open with default PDF app", () => void this.plugin.openInDefaultApp(this.leaf));
+      defaultApp?.setAttribute("aria-label", "Open with default PDF app");
+    }
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", (leaf) => {
         if (leaf === this.leaf) this.focusApp();
@@ -1221,14 +1293,16 @@ var PdfCraftView = class extends import_obsidian.FileView {
     return this.autoSavePromise;
   }
   async flushAutoSaveBeforeClose() {
-    if (!this.dirty || !this.plugin.settings.autoSave || this.plugin.settings.saveMode !== "overwrite") return;
+    if (!this.dirty) return true;
+    if (!this.plugin.settings.autoSave || this.plugin.settings.saveMode !== "overwrite") return false;
     if (!this.hostReady) {
       new import_obsidian.Notice("PdfCraft still has unsaved changes; this web build did not expose automatic saving. Use PdfCraft's Save button before closing.", 1e4);
-      return;
+      return false;
     }
     this.clearAutoSaveSchedule();
     const saved = await Promise.race([this.beginAutoSave(), sleep(5e3).then(() => false)]);
-    if (!saved) new import_obsidian.Notice("PdfCraft still has unsaved changes. Reopen the PDF and use PdfCraft's Save button if needed.", 1e4);
+    if (!saved) new import_obsidian.Notice("PdfCraft still has unsaved changes. Use its Save button before leaving this PDF.", 1e4);
+    return saved;
   }
   clearAutoSaveSchedule() {
     if (this.autoSaveTimer !== null) window.clearTimeout(this.autoSaveTimer);
