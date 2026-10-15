@@ -1,0 +1,12 @@
+# Local Obsidian test vault
+.obsidian/
+
+# Downloaded PdfCraft web builds and local PDF backups
+pdfcraft-web/
+backups/
+
+# Editor and operating system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
