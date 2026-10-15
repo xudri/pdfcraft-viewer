@@ -65,11 +65,6 @@ The plugin loads the selected PdfCraft web build from local files in an embedded
 - PdfCraft is evolving quickly; a change to its web build's loading, file-open, or save behavior may require a plugin update.
 - Embedded PdfCraft shares Obsidian's main thread. Large documents or other plugins doing background work can affect responsiveness.
 
-## Publishing a release
-
-This repository includes a GitHub Actions workflow that creates a release when a version tag is pushed. The tag must match `manifest.json`'s version exactly, such as `0.5.0`. The release includes the individual plugin files needed by Obsidian and BRAT, plus an installable ZIP.
-
-The plugin is licensed under [MIT](LICENSE), with `xudri` as the manifest author. To make a release, commit the files to your GitHub repository, then push a tag matching the manifest version, such as `0.5.0`. Enable GitHub Issues if you want bug reports from testers.
 
 ## Credits
 
