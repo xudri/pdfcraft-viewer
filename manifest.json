@@ -1,7 +1,7 @@
 {
   "id": "pdfcraft-viewer",
   "name": "PdfCraft Viewer",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "minAppVersion": "1.4.0",
   "description": "Replaces the built-in PDF viewer with PdfCraft, an open-source Acrobat alternative. Swap PdfCraft web builds without changing the plugin.",
   "author": "xudri",

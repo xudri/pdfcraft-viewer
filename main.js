@@ -1114,6 +1114,8 @@ var PdfCraftView = class extends import_obsidian.FileView {
     this.pageUrl = null;
     this.msgHandler = null;
     this.loadGeneration = 0;
+    this.reloadToken = 0;
+    this.initialDropDone = false;
     this.autoSaveTimer = null;
     this.autoSaveWatchdog = null;
     this.autoSaveSupportTimer = null;
@@ -1162,6 +1164,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
   }
   async onLoadFile(file) {
     this.teardown();
+    this.initialDropDone = false;
     const loadGeneration = this.loadGeneration;
     this.contentEl.empty();
     this.contentEl.addClass("pdfcraft-host");
@@ -1182,6 +1185,10 @@ var PdfCraftView = class extends import_obsidian.FileView {
     const iframe = this.contentEl.createEl("iframe", { cls: "pdfcraft-frame" });
     iframe.setAttr("allow", "fullscreen; clipboard-read; clipboard-write");
     this.iframe = iframe;
+    iframe.addEventListener("load", () => {
+      if (loadGeneration !== this.loadGeneration || this.iframe !== iframe || !this.initialDropDone) return;
+      void this.recoverAfterReload(iframe, file, loadGeneration);
+    });
     try {
       this.msgHandler = (e) => {
         if (e.source !== iframe.contentWindow) return;
@@ -1218,6 +1225,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
         return;
       }
       this.dropFile(iframe, file.name, bytes);
+      this.initialDropDone = true;
       this.autoSaveSupportTimer = window.setTimeout(() => {
         this.autoSaveSupportTimer = null;
         if (this.plugin.settings.autoSave && !this.hostReady) {
@@ -1318,6 +1326,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
   }
   teardown() {
     this.loadGeneration++;
+    this.initialDropDone = false;
     this.clearAutoSaveTimers();
     this.hostReady = false;
     this.dirty = false;
@@ -1332,6 +1341,30 @@ var PdfCraftView = class extends import_obsidian.FileView {
     if (this.pageUrl) {
       URL.revokeObjectURL(this.pageUrl);
       this.pageUrl = null;
+    }
+  }
+  /** Obsidian moves a tab's DOM when you split/rearrange panes. Browsers reload an iframe that gets moved,
+   *  so PdfCraft restarts empty. Wait for it to come back and hand the PDF over again. */
+  async recoverAfterReload(iframe, file, generation) {
+    const token = ++this.reloadToken;
+    const hadUnsaved = this.dirty;
+    this.hostReady = false;
+    this.dirty = false;
+    this.clearAutoSaveSchedule();
+    if (this.autoSavePending) this.finishAutoSave(false);
+    const isCurrent = () => generation === this.loadGeneration && token === this.reloadToken && this.iframe === iframe;
+    try {
+      const ready = await this.waitReady(iframe, 25e3, isCurrent);
+      if (!ready || !isCurrent()) return;
+      const bytes = await this.app.vault.readBinary(file);
+      if (!isCurrent()) return;
+      this.dropFile(iframe, file.name, bytes);
+      this.focusApp();
+      if (hadUnsaved) {
+        new import_obsidian.Notice("PdfCraft reloaded after the layout change. Edits made in the last few seconds before it were not saved.", 1e4);
+      }
+    } catch (e) {
+      console.error("PdfCraft: could not restore the PDF after reload", e);
     }
   }
   /** PdfCraft has no "open this file" API, so we wait for its canvas to come alive and "drop" the PDF on it. */
