@@ -768,6 +768,32 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     if (!this.enabledHere) return;
     const leaf = this.app.workspace.getLeaf(false);
     await leaf.setViewState({ type: VIEW_TYPE, state: { file: file.path }, active: true });
+    this.trimViewerHistory(leaf, file.path);
+  }
+  /** Switching a PDF between PdfCraft and Obsidian's viewer is not real navigation, so it must not add a Back step.
+   *  Remove the history entries that only show this same PDF in one of the two viewers. */
+  trimViewerHistory(leaf, path) {
+    const check = (vs) => !!vs && (vs.type === "pdf" || vs.type === VIEW_TYPE) && !!vs.state && vs.state.file === path;
+    const isSame = (entry) => check(entry?.state) || check(entry);
+    const run = () => {
+      try {
+        const history = leaf?.history;
+        if (!history) return;
+        if (Array.isArray(history.backHistory)) {
+          while (history.backHistory.length && isSame(history.backHistory[history.backHistory.length - 1])) {
+            history.backHistory.pop();
+          }
+        }
+        if (Array.isArray(history.forwardHistory)) {
+          history.forwardHistory = history.forwardHistory.filter((entry) => !isSame(entry));
+        }
+        if (typeof leaf.updateHeader === "function") leaf.updateHeader();
+      } catch (error) {
+        console.warn("PdfCraft Viewer: could not tidy the Back history", error);
+      }
+    };
+    run();
+    window.setTimeout(run, 60);
   }
   pdfFileInLeaf(leaf) {
     let file = leaf?.view?.file;
@@ -787,6 +813,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
         state: { file: file.path },
         active: true
       });
+      this.trimViewerHistory(leaf, file.path);
       this.refreshNativeActions();
     } catch (error) {
       console.error("PdfCraft Viewer: could not switch PDF viewer", error);
@@ -929,6 +956,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     if (intent.targetType === VIEW_TYPE && !this.enabledHere) return;
     try {
       await leaf.setViewState({ type: intent.targetType, state: { file: intent.path }, active: true });
+      this.trimViewerHistory(leaf, intent.path);
       this.refreshNativeActions();
     } catch (error) {
       console.error("PdfCraft Viewer: could not use the selected PDF link viewer", error);
@@ -1170,6 +1198,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
     this.contentEl.addClass("pdfcraft-host");
     if (!this.plugin.enabledHere || this.plugin.pendingNativeLinkFor(file)) {
       await this.leaf.setViewState({ type: "pdf", state: { file: file.path }, active: true });
+      this.plugin.trimViewerHistory(this.leaf, file.path);
       return;
     }
     const version = await this.plugin.resolveVersion();
@@ -1185,6 +1214,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
     const iframe = this.contentEl.createEl("iframe", { cls: "pdfcraft-frame" });
     iframe.setAttr("allow", "fullscreen; clipboard-read; clipboard-write");
     this.iframe = iframe;
+    iframe.style.visibility = "hidden";
     iframe.addEventListener("load", () => {
       if (loadGeneration !== this.loadGeneration || this.iframe !== iframe || !this.initialDropDone) return;
       void this.recoverAfterReload(iframe, file, loadGeneration);
@@ -1220,6 +1250,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
       const ready = await this.waitReady(iframe, 25e3, () => loadGeneration === this.loadGeneration);
       if (loadGeneration !== this.loadGeneration) return;
       if (!ready) {
+        iframe.style.visibility = "";
         status.setText("PdfCraft took too long to start. Try reopening the PDF or switching the renderer to WebGL2 in the plugin settings.");
         new import_obsidian.Notice("PdfCraft took too long to start. Try reopening the PDF or switching Renderer to WebGL2 in the plugin settings.", 1e4);
         return;
@@ -1232,7 +1263,8 @@ var PdfCraftView = class extends import_obsidian.FileView {
           new import_obsidian.Notice("This PdfCraft web build did not enable the host bridge, so automatic saving is unavailable. Use its Save button.", 1e4);
         }
       }, 5e3);
-      status.remove();
+      status.setText("Opening " + file.name + "\u2026");
+      this.revealWhenOpened(iframe, status, bytes.byteLength, loadGeneration);
       this.focusApp();
     } catch (e) {
       if (loadGeneration !== this.loadGeneration) return;
@@ -1343,10 +1375,22 @@ var PdfCraftView = class extends import_obsidian.FileView {
       this.pageUrl = null;
     }
   }
+  /** Keeps PdfCraft's start screen out of sight: the frame stays hidden until the dropped PDF has had time to open
+   *  (a little longer for bigger files). */
+  revealWhenOpened(iframe, status, size, generation) {
+    const delay = Math.min(3500, 700 + Math.round(size / 1048576) * 120);
+    window.setTimeout(() => {
+      if (generation !== this.loadGeneration || this.iframe !== iframe) return;
+      iframe.style.visibility = "";
+      status?.remove();
+    }, delay);
+  }
   /** Obsidian moves a tab's DOM when you split/rearrange panes. Browsers reload an iframe that gets moved,
    *  so PdfCraft restarts empty. Wait for it to come back and hand the PDF over again. */
   async recoverAfterReload(iframe, file, generation) {
     const token = ++this.reloadToken;
+    iframe.style.visibility = "hidden";
+    const status = this.contentEl.createDiv({ cls: "pdfcraft-msg", text: "Reopening " + file.name + "\u2026" });
     const hadUnsaved = this.dirty;
     this.hostReady = false;
     this.dirty = false;
@@ -1355,16 +1399,26 @@ var PdfCraftView = class extends import_obsidian.FileView {
     const isCurrent = () => generation === this.loadGeneration && token === this.reloadToken && this.iframe === iframe;
     try {
       const ready = await this.waitReady(iframe, 25e3, isCurrent);
-      if (!ready || !isCurrent()) return;
+      if (!ready || !isCurrent()) {
+        if (isCurrent()) iframe.style.visibility = "";
+        status.remove();
+        return;
+      }
       const bytes = await this.app.vault.readBinary(file);
-      if (!isCurrent()) return;
+      if (!isCurrent()) {
+        status.remove();
+        return;
+      }
       this.dropFile(iframe, file.name, bytes);
+      this.revealWhenOpened(iframe, status, bytes.byteLength, generation);
       this.focusApp();
       if (hadUnsaved) {
         new import_obsidian.Notice("PdfCraft reloaded after the layout change. Edits made in the last few seconds before it were not saved.", 1e4);
       }
     } catch (e) {
       console.error("PdfCraft: could not restore the PDF after reload", e);
+      if (isCurrent()) iframe.style.visibility = "";
+      status.remove();
     }
   }
   /** PdfCraft has no "open this file" API, so we wait for its canvas to come alive and "drop" the PDF on it. */
