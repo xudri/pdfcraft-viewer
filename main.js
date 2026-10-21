@@ -510,6 +510,8 @@ var DEFAULTS = {
   renderer: "auto",
   preload: true,
   forwardHotkeys: true,
+  hotkeyMode: "common",
+  smoothResize: true,
   enableOnMobile: false,
   linkViewer: "native",
   autoSave: true
@@ -524,7 +526,7 @@ function cmpVersion(a, b) {
   }
   return 0;
 }
-function makeHook(renderer) {
+function makeHook(renderer, startupUrl = null) {
   return `<script>
 (function () {
   if (${JSON.stringify(renderer)} === "webgl") {
@@ -535,8 +537,24 @@ function makeHook(renderer) {
   // no query string, so expose that one parameter while leaving the rest alone.
   var paramsGet = URLSearchParams.prototype.get;
   URLSearchParams.prototype.get = function (key) {
-    return key === "host" ? "parent" : paramsGet.call(this, key);
+    if (key === "host") return "parent";
+    if (key === "file" && ${JSON.stringify(startupUrl)}) return ${JSON.stringify(startupUrl)};
+    return paramsGet.call(this, key);
   };
+  // Supply the prepared bytes immediately on first startup, and read the latest
+  // vault contents if moving an Obsidian pane reloads this page.
+  var startupUrl = ${JSON.stringify(startupUrl)};
+  if (startupUrl) {
+    var originalFetch = window.fetch.bind(window);
+    window.fetch = function (input, options) {
+      if (input === startupUrl && window.frameElement?.__pdfcraftReadStartup) {
+        return window.frameElement.__pdfcraftReadStartup().then(function (bytes) {
+          return new Response(bytes, { headers: { "Content-Type": "application/pdf" } });
+        });
+      }
+      return originalFetch(input, options);
+    };
+  }
   window.__pdfcraftRequestSave = function () {
     var canvas = document.getElementById("pdfcraft");
     if (!canvas) return false;
@@ -601,14 +619,19 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     this.tookOver = false;
     this.nativeActions = /* @__PURE__ */ new Map();
     this.preloadTimer = null;
+    this.preloadIdle = null;
+    this.versionCache = null;
     this.disposed = false;
     this.pendingLinkIntent = null;
     /** Called from inside the PdfCraft page on every key press. Returns true if Obsidian handled it. */
     this.forwardKey = (e) => {
-      if (!this.settings.forwardHotkeys || e.isComposing) return false;
+      const mode = this.settings.hotkeyMode;
+      if (mode === "pdfcraft" || e.isComposing) return false;
+      if (e.getModifierState && e.getModifierState("AltGraph")) return false;
+      if (["Control", "Shift", "Alt", "Meta", "AltGraph"].includes(e.key)) return false;
       const isFKey = /^F\d{1,2}$/.test(e.key);
       if (!(e.ctrlKey || e.metaKey || e.altKey) && !isFKey) return false;
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && _PdfCraftPlugin.RESERVED.has(e.key.toLowerCase())) return false;
+      if (mode === "common" && (e.ctrlKey || e.metaKey) && !e.altKey && _PdfCraftPlugin.RESERVED.has(e.key.toLowerCase())) return false;
       const ev = new KeyboardEvent("keydown", {
         key: e.key,
         code: e.code,
@@ -622,8 +645,9 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
         composed: true
       });
       document.body.dispatchEvent(ev);
-      return ev.defaultPrevented;
+      return mode === "obsidian" ? true : ev.defaultPrevented;
     };
+    this.lastNativePage = /* @__PURE__ */ new Map();
   }
   /* ---------------------------- lifecycle ---------------------------- */
   async onload() {
@@ -681,13 +705,19 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       const versions = await this.listVersions();
       if (this.disposed) return;
       if (versions.length && this.settings.preload && this.enabledHere) {
-        this.preloadTimer = window.setTimeout(async () => {
+        const preload = async () => {
           this.preloadTimer = null;
-          if (this.disposed) return;
+          this.preloadIdle = null;
+          if (this.disposed || !this.settings.preload) return;
           const v = await this.resolveVersion();
           if (v && !this.disposed) this.getBuild(v).catch(() => {
           });
-        }, 4e3);
+        };
+        if (window.requestIdleCallback) {
+          this.preloadIdle = window.requestIdleCallback(() => void preload().catch(() => {}), { timeout: 2500 });
+        } else {
+          this.preloadTimer = window.setTimeout(() => void preload().catch(() => {}), 1000);
+        }
       }
       if (!versions.length) {
         new import_obsidian.Notice(
@@ -700,6 +730,8 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
   onunload() {
     this.disposed = true;
     if (this.preloadTimer !== null) window.clearTimeout(this.preloadTimer);
+    if (this.preloadIdle !== null) window.cancelIdleCallback?.(this.preloadIdle);
+    this.versionCache = null;
     for (const buttons of this.nativeActions.values()) buttons.forEach((button) => button.remove());
     this.nativeActions.clear();
     delete window.__pdfcraftForwardKey;
@@ -707,9 +739,14 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     this.releaseBuilds();
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULTS, await this.loadData());
+    const saved = await this.loadData();
+    this.settings = Object.assign({}, DEFAULTS, saved);
+    if (!saved || saved.hotkeyMode === void 0) {
+      this.settings.hotkeyMode = saved && saved.forwardHotkeys === false ? "pdfcraft" : "common";
+    }
   }
   async saveSettings() {
+    this.versionCache = null;
     await this.saveData(this.settings);
   }
   refreshAutoSaveSettings() {
@@ -767,6 +804,10 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
   async openInPdfCraft(file) {
     if (!this.enabledHere) return;
     const leaf = this.app.workspace.getLeaf(false);
+    if (leaf.view?.getViewType() === VIEW_TYPE && leaf.view.file?.path === file.path) {
+      leaf.view.focusApp?.();
+      return;
+    }
     await leaf.setViewState({ type: VIEW_TYPE, state: { file: file.path }, active: true });
     this.trimViewerHistory(leaf, file.path);
   }
@@ -795,6 +836,17 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     run();
     window.setTimeout(run, 60);
   }
+  /** Page the Obsidian viewer is showing (uses Obsidian's internal viewer object, so it is best-effort). */
+  nativePageOf(leaf) {
+    try {
+      const view = leaf?.view;
+      if (view?.getViewType?.() !== "pdf") return null;
+      const n = view.viewer?.child?.pdfViewer?.pdfViewer?.currentPageNumber;
+      return Number.isInteger(n) && n > 0 ? n : null;
+    } catch (_) {
+      return null;
+    }
+  }
   pdfFileInLeaf(leaf) {
     let file = leaf?.view?.file;
     if (!(file instanceof import_obsidian.TFile)) {
@@ -808,11 +860,20 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     const type = leaf?.view?.getViewType();
     if (!file || type !== "pdf" && type !== VIEW_TYPE || type === "pdf" && !this.enabledHere) return;
     try {
-      await leaf.setViewState({
-        type: type === "pdf" ? VIEW_TYPE : "pdf",
-        state: { file: file.path },
-        active: true
-      });
+      if (type === "pdf") {
+        const page = this.nativePageOf(leaf);
+        if (page) this.lastNativePage.set(file.path, page);
+      }
+      const goingNative = type !== "pdf";
+      const remembered = goingNative ? this.lastNativePage.get(file.path) : void 0;
+      await leaf.setViewState(
+        {
+          type: goingNative ? "pdf" : VIEW_TYPE,
+          state: { file: file.path },
+          active: true
+        },
+        remembered ? { subpath: "#page=" + remembered } : void 0
+      );
       this.trimViewerHistory(leaf, file.path);
       this.refreshNativeActions();
     } catch (error) {
@@ -968,14 +1029,21 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     return (0, import_obsidian.normalizePath)(`${this.manifest.dir}/pdfcraft-web`);
   }
   async listVersions() {
+    if (this.versionCache && Date.now() - this.versionCache.time < 2000) return this.versionCache.promise;
+    const cached = { time: Date.now(), promise: this.scanVersions() };
+    this.versionCache = cached;
+    cached.promise.catch(() => {
+      if (this.versionCache === cached) this.versionCache = null;
+    });
+    return cached.promise;
+  }
+  async scanVersions() {
     const ad = this.app.vault.adapter;
     if (!await ad.exists(this.webRoot)) return [];
     const listing = await ad.list(this.webRoot);
-    const out = [];
-    for (const folder of listing.folders) {
-      const name = folder.split("/").pop();
-      if (await ad.exists((0, import_obsidian.normalizePath)(`${folder}/index.html`))) out.push(name);
-    }
+    const entries = await Promise.all(listing.folders.map(async (folder) =>
+      await ad.exists((0, import_obsidian.normalizePath)(`${folder}/index.html`)) ? folder.split("/").pop() : null));
+    const out = entries.filter((name) => name !== null);
     return out.sort(cmpVersion).reverse();
   }
   async resolveVersion() {
@@ -991,7 +1059,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     });
     this.buildCache.clear();
   }
-  /** Builds a self-contained page (srcdoc) from the files of one PdfCraft web build. */
+  /** Builds a self-contained iframe page from the files of one PdfCraft web build. */
   getBuild(version) {
     let p = this.buildCache.get(version);
     if (!p) {
@@ -1008,14 +1076,30 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     const jsName = (html.match(/['"]\.\/([^'"]+\.js)['"]/) || [])[1];
     const wasmName = (html.match(/['"]\.\/([^'"]+\.wasm)['"]/) || [])[1];
     if (!jsName || !wasmName) throw new Error("Unrecognised PdfCraft index.html layout (can't find .js/.wasm).");
-    const jsBytes = await ad.readBinary(`${base}/${jsName}`);
-    const wasmBytes = await ad.readBinary(`${base}/${wasmName}`);
+    const [jsBytes, wasmBytes] = await Promise.all([
+      ad.readBinary(`${base}/${jsName}`),
+      ad.readBinary(`${base}/${wasmName}`)
+    ]);
     const jsUrl = URL.createObjectURL(new Blob([jsBytes], { type: "text/javascript" }));
     const wasmUrl = URL.createObjectURL(new Blob([wasmBytes], { type: "application/wasm" }));
     html = html.replace(/<link[^>]+rel=["'](?:modulepreload|preload)["'][^>]*>/g, "");
     html = html.split(`./${jsName}`).join(jsUrl).split(`./${wasmName}`).join(wasmUrl);
+    // Compile once per installed build. Each iframe still gets its own instance and memory.
+    // An unsupported loader or a failed compile keeps the original URL-based loader.
+    let sharedLoader = false;
+    html = html.replace(/module_or_path\s*:\s*(["'])(blob:[^"']+)\1/g,
+      (_match, _quote, url) => {
+        sharedLoader = true;
+        return "module_or_path: (await window.frameElement?.__pdfcraftModule) || " + JSON.stringify(url);
+      });
+    const modulePromise = sharedLoader ? WebAssembly.compile(wasmBytes).then((compiled) => {
+      // Once the loader has a module, its raw WASM blob is no longer needed.
+      if (sharedLoader) URL.revokeObjectURL(wasmUrl);
+      return compiled;
+    }).catch(() => null) : Promise.resolve(null);
     html = html.replace(/<head>/i, "<head><!--PDFCRAFT_HOOK-->");
-    return { template: html, urls: [jsUrl, wasmUrl] };
+    return { template: html, urls: [jsUrl, wasmUrl], modulePromise,
+      directOpen: cmpVersion(version, "0.10.1") >= 0 };
   }
   /* ------------------------------ updates ------------------------------ */
   async ensureDir(path) {
@@ -1063,6 +1147,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
           data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
         );
       }
+      this.versionCache = null;
       if (!this.settings.activeVersion && currentVersion) {
         this.settings.activeVersion = currentVersion;
         await this.saveSettings();
@@ -1140,9 +1225,15 @@ var PdfCraftView = class extends import_obsidian.FileView {
     this.plugin = plugin;
     this.iframe = null;
     this.pageUrl = null;
+    this.startupOpen = false;
+    this.startupFailed = null;
     this.msgHandler = null;
+    this.messageWindow = null;
     this.loadGeneration = 0;
     this.reloadToken = 0;
+    this.frameDocument = null;
+    this.loadRequest = null;
+    this.loadedFileKey = null;
     this.initialDropDone = false;
     this.autoSaveTimer = null;
     this.autoSaveWatchdog = null;
@@ -1185,12 +1276,34 @@ var PdfCraftView = class extends import_obsidian.FileView {
   focusApp() {
     try {
       const w = this.iframe?.contentWindow;
+      if (this.iframe?.ownerDocument.activeElement === this.iframe && w?.document.activeElement?.id === "pdfcraft") return;
       w?.focus();
       w?.document.getElementById("pdfcraft")?.focus();
     } catch (_) {
     }
   }
   async onLoadFile(file) {
+    const key = this.fileLoadKey(file);
+    if (this.plugin.enabledHere && !this.plugin.pendingNativeLinkFor(file)) {
+      if (this.loadRequest?.key === key) return this.loadRequest.promise;
+      if (this.loadedFileKey === key && this.iframe && this.initialDropDone && (!this.startupOpen || this.hostReady)) {
+        this.focusApp();
+        return;
+      }
+    }
+    const promise = this.startPdfCraftFile(file);
+    const request = { key, promise };
+    this.loadRequest = request;
+    try {
+      await promise;
+    } finally {
+      if (this.loadRequest === request) this.loadRequest = null;
+    }
+  }
+  fileLoadKey(file) {
+    return JSON.stringify([file.path, file.stat?.mtime, file.stat?.size, this.plugin.settings.renderer, this.plugin.settings.activeVersion]);
+  }
+  async startPdfCraftFile(file) {
     this.teardown();
     this.initialDropDone = false;
     const loadGeneration = this.loadGeneration;
@@ -1210,13 +1323,18 @@ var PdfCraftView = class extends import_obsidian.FileView {
       });
       return;
     }
-    const status = this.contentEl.createDiv({ cls: "pdfcraft-msg", text: "Loading PdfCraft\u2026" });
+    const status = this.contentEl.createDiv({ cls: "pdfcraft-msg", text: "Opening " + file.name + "\u2026" });
     const iframe = this.contentEl.createEl("iframe", { cls: "pdfcraft-frame" });
     iframe.setAttr("allow", "fullscreen; clipboard-read; clipboard-write");
     this.iframe = iframe;
     iframe.style.visibility = "hidden";
+    this.attachResizeFreeze(iframe);
     iframe.addEventListener("load", () => {
-      if (loadGeneration !== this.loadGeneration || this.iframe !== iframe || !this.initialDropDone) return;
+      if (loadGeneration !== this.loadGeneration || this.iframe !== iframe) return;
+      const frameDocument = iframe.contentDocument;
+      if (!frameDocument || frameDocument === this.frameDocument) return;
+      this.frameDocument = frameDocument;
+      if (!this.initialDropDone) return;
       void this.recoverAfterReload(iframe, file, loadGeneration);
     });
     try {
@@ -1226,26 +1344,46 @@ var PdfCraftView = class extends import_obsidian.FileView {
         if (!d || loadGeneration !== this.loadGeneration) return;
         if (d.type === "pdfcraft:ready") {
           this.hostReady = true;
+        } else if (d.type === "pdfcraft:failed") {
+          this.startupFailed = String(d.error || "PdfCraft could not start.");
         } else if (d.type === "pdfcraft:dirty") {
           this.dirty = d.dirty === true;
           if (this.dirty) this.scheduleAutoSave();
           else this.clearAutoSaveSchedule();
-        } else if (d.type === "pdfcraft:save" && (d.bytes instanceof ArrayBuffer || ArrayBuffer.isView(d.bytes))) {
-          const bytes = d.bytes instanceof ArrayBuffer ? d.bytes : d.bytes.buffer.slice(d.bytes.byteOffset, d.bytes.byteOffset + d.bytes.byteLength);
+        } else if (d.type === "pdfcraft:save" && (d.bytes instanceof iframe.ownerDocument.defaultView.ArrayBuffer || ArrayBuffer.isView(d.bytes))) {
+          const bytes = d.bytes instanceof iframe.ownerDocument.defaultView.ArrayBuffer ? d.bytes : d.bytes.buffer.slice(d.bytes.byteOffset, d.bytes.byteOffset + d.bytes.byteLength);
           void this.saveFromFrame(file, d.name, new Blob([bytes], { type: "application/pdf" }), d.saveAs === true);
         } else if (d.__pdfcraft === "activity") {
           if (this.dirty) this.scheduleAutoSave();
-        } else if (d.__pdfcraft === "save" && d.blob instanceof Blob) {
+        } else if (d.__pdfcraft === "save" && d.blob instanceof iframe.ownerDocument.defaultView.Blob) {
           void this.saveFromFrame(file, d.name, d.blob, false);
         }
       };
-      window.addEventListener("message", this.msgHandler);
-      const build = await this.plugin.getBuild(version);
+      this.messageWindow = iframe.ownerDocument.defaultView;
+      this.messageWindow.addEventListener("message", this.msgHandler);
+      const [build, bytes] = await Promise.all([
+        this.plugin.getBuild(version), this.app.vault.readBinary(file)
+      ]);
       if (loadGeneration !== this.loadGeneration) return;
-      const page = build.template.replace("<!--PDFCRAFT_HOOK-->", makeHook(this.plugin.settings.renderer));
+      // The private URL preserves the exact filename for PdfCraft's startup loader.
+      // The hook supplies local bytes through fetch; no network request or file drop.
+      this.startupOpen = build.directOpen && !file.name.includes("?");
+      const startupUrl = this.startupOpen ? "pdfcraft-vault://document/" + file.name : null;
+      iframe.__pdfcraftModule = build.modulePromise;
+      if (this.startupOpen) {
+        let prepared = bytes;
+        iframe.__pdfcraftReadStartup = async () => {
+          if (prepared) {
+            const first = prepared;
+            prepared = null;
+            return first;
+          }
+          return this.app.vault.readBinary(file);
+        };
+      }
+      const page = build.template.replace("<!--PDFCRAFT_HOOK-->", makeHook(this.plugin.settings.renderer, startupUrl));
       this.pageUrl = URL.createObjectURL(new Blob([page], { type: "text/html" }));
       iframe.src = this.pageUrl;
-      const bytes = await this.app.vault.readBinary(file);
       if (loadGeneration !== this.loadGeneration) return;
       const ready = await this.waitReady(iframe, 25e3, () => loadGeneration === this.loadGeneration);
       if (loadGeneration !== this.loadGeneration) return;
@@ -1255,8 +1393,9 @@ var PdfCraftView = class extends import_obsidian.FileView {
         new import_obsidian.Notice("PdfCraft took too long to start. Try reopening the PDF or switching Renderer to WebGL2 in the plugin settings.", 1e4);
         return;
       }
-      this.dropFile(iframe, file.name, bytes);
+      if (!this.startupOpen) this.dropFile(iframe, file.name, bytes);
       this.initialDropDone = true;
+      this.loadedFileKey = this.fileLoadKey(file);
       this.autoSaveSupportTimer = window.setTimeout(() => {
         this.autoSaveSupportTimer = null;
         if (this.plugin.settings.autoSave && !this.hostReady) {
@@ -1282,9 +1421,11 @@ var PdfCraftView = class extends import_obsidian.FileView {
   }
   async saveFromFrame(file, name, blob, saveAs) {
     const automatic = this.autoSavePending;
+    const generation = this.loadGeneration;
     try {
       if (automatic && (name !== file.name || saveAs)) throw new Error("Automatic save was stopped because PdfCraft switched to a different document.");
       await this.plugin.handleSave(file, name, blob, saveAs);
+      if (generation === this.loadGeneration && this.initialDropDone) this.loadedFileKey = this.fileLoadKey(file);
       if (automatic) this.finishAutoSave(true);
       if (this.dirty) this.scheduleAutoSave();
     } catch (error) {
@@ -1358,14 +1499,24 @@ var PdfCraftView = class extends import_obsidian.FileView {
   }
   teardown() {
     this.loadGeneration++;
+    this.loadRequest = null;
+    this.loadedFileKey = null;
+    this.frameDocument = null;
+    this.cancelReadyWait?.();
     this.initialDropDone = false;
+    this.detachResizeFreeze();
     this.clearAutoSaveTimers();
     this.hostReady = false;
+    this.startupFailed = null;
+    this.startupOpen = false;
     this.dirty = false;
     this.autoSaveUnavailable = false;
-    if (this.msgHandler) window.removeEventListener("message", this.msgHandler);
+    if (this.msgHandler) this.messageWindow?.removeEventListener("message", this.msgHandler);
     this.msgHandler = null;
+    this.messageWindow = null;
     if (this.iframe) {
+      delete this.iframe.__pdfcraftReadStartup;
+      delete this.iframe.__pdfcraftModule;
       this.iframe.src = "about:blank";
       this.iframe.remove();
       this.iframe = null;
@@ -1375,15 +1526,113 @@ var PdfCraftView = class extends import_obsidian.FileView {
       this.pageUrl = null;
     }
   }
-  /** Keeps PdfCraft's start screen out of sight: the frame stays hidden until the dropped PDF has had time to open
-   *  (a little longer for bigger files). */
-  revealWhenOpened(iframe, status, size, generation) {
-    const delay = Math.min(3500, 700 + Math.round(size / 1048576) * 120);
-    window.setTimeout(() => {
+  /** Dragging a pane divider makes PdfCraft rebuild its drawing surface on every frame, which is what causes the lag.
+   *  So when a divider is grabbed, the frame is pinned at its current size (and ignores the mouse). When the divider is
+   *  released the old picture is stretched smoothly to the new size, then PdfCraft gets the final size once.
+   *  This only reacts to the mouse on a divider, never to size changes by itself, so it cannot start a resize loop. */
+  attachResizeFreeze(iframe) {
+    this.detachResizeFreeze();
+    const host = this.contentEl;
+    let frozen = false;
+    let animating = false;
+    let settled = { w: 0, h: 0 };
+    let animTimer = 0;
+    let maxTimer = 0;
+    let upTimer = 0;
+    const smooth = () => this.plugin.settings.smoothResize !== false;
+    const clearFrame = () => {
+      const st = iframe.style;
+      st.position = "";
+      st.top = "";
+      st.left = "";
+      st.width = "";
+      st.height = "";
+      st.transform = "";
+      st.transition = "";
+      st.transformOrigin = "";
+      st.pointerEvents = "";
+    };
+    const finish = () => {
+      window.clearTimeout(animTimer);
+      window.clearTimeout(maxTimer);
+      window.clearTimeout(upTimer);
+      animating = false;
+      frozen = false;
+      clearFrame();
+    };
+    const reduceMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const snap = () => {
+      if (!frozen || animating) return;
+      const w = host.clientWidth;
+      const h = host.clientHeight;
+      if (!w || !h || Math.abs(w - settled.w) < 3 && Math.abs(h - settled.h) < 3 || reduceMotion()) return finish();
+      animating = true;
+      const st = iframe.style;
+      st.transformOrigin = "0 0";
+      st.transition = "transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1)";
+      void iframe.offsetWidth; // make the browser notice the starting state before animating
+      st.transform = "scale(" + w / settled.w + ", " + h / settled.h + ")";
+      animTimer = window.setTimeout(finish, 200);
+    };
+    const freeze = () => {
+      if (frozen) return;
+      const w = host.clientWidth;
+      const h = host.clientHeight;
+      if (!w || !h) return;
+      settled = { w, h };
+      frozen = true;
+      const st = iframe.style;
+      st.position = "absolute";
+      st.top = "0";
+      st.left = "0";
+      st.width = w + "px";
+      st.height = h + "px";
+      st.pointerEvents = "none"; // lets the mouse-release reach Obsidian even over the frame
+      maxTimer = window.setTimeout(snap, 8e3); // safety net: never stay frozen
+    };
+    const onDown = (e) => {
+      const target = e && e.target;
+      if (smooth() && !frozen && target && target.closest && target.closest(".workspace-leaf-resize-handle")) freeze();
+    };
+    const onUp = () => {
+      if (frozen && !animating) {
+        window.clearTimeout(upTimer);
+        upTimer = window.setTimeout(snap, 50);
+      }
+    };
+    const onMove = (e) => {
+      if (frozen && !animating && e.buttons === 0) onUp(); // the mouse-up was missed
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("pointerup", onUp, true);
+    window.addEventListener("pointercancel", onUp, true);
+    window.addEventListener("pointermove", onMove, true);
+    this.resizeFreeze = {
+      cleanup: () => {
+        window.clearTimeout(animTimer);
+        window.clearTimeout(maxTimer);
+        window.clearTimeout(upTimer);
+        window.removeEventListener("pointerdown", onDown, true);
+        window.removeEventListener("pointerup", onUp, true);
+        window.removeEventListener("pointercancel", onUp, true);
+        window.removeEventListener("pointermove", onMove, true);
+        clearFrame();
+      }
+    };
+  }
+  detachResizeFreeze() {
+    if (!this.resizeFreeze) return;
+    this.resizeFreeze.cleanup();
+    this.resizeFreeze = null;
+  }
+  /** Reveal on the next browser paint, without an arbitrary file-size-based delay. */
+  revealWhenOpened(iframe, status, _size, generation) {
+    const win = iframe.ownerDocument.defaultView;
+    win.requestAnimationFrame(() => {
       if (generation !== this.loadGeneration || this.iframe !== iframe) return;
       iframe.style.visibility = "";
       status?.remove();
-    }, delay);
+    });
   }
   /** Obsidian moves a tab's DOM when you split/rearrange panes. Browsers reload an iframe that gets moved,
    *  so PdfCraft restarts empty. Wait for it to come back and hand the PDF over again. */
@@ -1393,6 +1642,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
     const status = this.contentEl.createDiv({ cls: "pdfcraft-msg", text: "Reopening " + file.name + "\u2026" });
     const hadUnsaved = this.dirty;
     this.hostReady = false;
+    this.startupFailed = null;
     this.dirty = false;
     this.clearAutoSaveSchedule();
     if (this.autoSavePending) this.finishAutoSave(false);
@@ -1404,13 +1654,13 @@ var PdfCraftView = class extends import_obsidian.FileView {
         status.remove();
         return;
       }
-      const bytes = await this.app.vault.readBinary(file);
+      const bytes = this.startupOpen ? null : await this.app.vault.readBinary(file);
       if (!isCurrent()) {
         status.remove();
         return;
       }
-      this.dropFile(iframe, file.name, bytes);
-      this.revealWhenOpened(iframe, status, bytes.byteLength, generation);
+      if (bytes) this.dropFile(iframe, file.name, bytes);
+      this.revealWhenOpened(iframe, status, bytes?.byteLength || 0, generation);
       this.focusApp();
       if (hadUnsaved) {
         new import_obsidian.Notice("PdfCraft reloaded after the layout change. Edits made in the last few seconds before it were not saved.", 1e4);
@@ -1421,16 +1671,67 @@ var PdfCraftView = class extends import_obsidian.FileView {
       status.remove();
     }
   }
-  /** PdfCraft has no "open this file" API, so we wait for its canvas to come alive and "drop" the PDF on it. */
+  /** Modern builds signal readiness; older builds retain canvas detection and file-drop compatibility. */
   async waitReady(iframe, timeoutMs = 25e3, isCurrent = () => true) {
+    if (this.startupOpen) {
+      if (!isCurrent()) return false;
+      if (this.startupFailed) throw new Error(this.startupFailed);
+      if (this.hostReady) return true;
+      this.cancelReadyWait?.();
+      const messageWindow = iframe.ownerDocument.defaultView;
+      return new Promise((resolve, reject) => {
+        let timer, canvasTimer, canvasReadyAt = null, finished = false;
+        const cancel = () => finish(false);
+        const finish = (ready, error) => {
+          if (finished) return;
+          finished = true;
+          window.clearTimeout(timer);
+          window.clearTimeout(canvasTimer);
+          messageWindow.removeEventListener("message", onMessage);
+          if (this.cancelReadyWait === cancel) this.cancelReadyWait = null;
+          if (error) reject(error);
+          else resolve(ready && isCurrent());
+        };
+        const onMessage = (event) => {
+          if (event.source !== iframe.contentWindow) return;
+          if (!isCurrent()) return finish(false);
+          if (event.data?.type === "pdfcraft:ready") finish(true);
+          else if (event.data?.type === "pdfcraft:failed") finish(false, new Error(String(event.data.error || "PdfCraft could not start.")));
+        };
+        this.cancelReadyWait = cancel;
+        messageWindow.addEventListener("message", onMessage);
+        // Opening a PDF must not depend on the optional host-saving bridge.
+        // Keep the original canvas-ready check as a fallback for Electron hosts
+        // that do not deliver the bridge's readiness message.
+        const checkCanvas = () => {
+          if (!isCurrent()) return finish(false);
+          try {
+            const canvas = iframe.contentWindow?.document.getElementById("pdfcraft");
+            if (canvas && (canvas.width !== 300 || canvas.height !== 150)) {
+              if (canvasReadyAt === null) canvasReadyAt = Date.now();
+              if (Date.now() - canvasReadyAt >= 400) return finish(true);
+            } else canvasReadyAt = null;
+          } catch (_) {}
+          canvasTimer = window.setTimeout(checkCanvas, 100);
+        };
+        checkCanvas();
+        timer = window.setTimeout(() => finish(false), timeoutMs);
+      });
+    }
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
       if (!isCurrent()) return false;
+      if (this.startupFailed) throw new Error(this.startupFailed);
+      if (this.hostReady) return true;
       try {
         const c = iframe.contentWindow?.document.getElementById("pdfcraft");
         if (c && (c.width !== 300 || c.height !== 150)) {
-          await sleep(400);
-          return isCurrent();
+          // Canvas resizing can precede app construction. Bridge-capable builds
+          // must finish constructing their app before we reveal or send anything.
+          if (!this.startupOpen) {
+            await sleep(400);
+            return isCurrent();
+          }
         }
       } catch (_) {
       }
@@ -1531,15 +1832,26 @@ var PdfCraftSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Preload PdfCraft at startup").setDesc("Loads PdfCraft's files into memory a few seconds after Obsidian starts, so your first PDF opens faster. Uses roughly 40 MB of memory.").addToggle(
+    new import_obsidian.Setting(containerEl).setName("Preload PdfCraft at startup").setDesc("Loads and compiles the PdfCraft engine a few seconds after startup. Later PDF tabs reuse the compiled engine. Uses additional memory.").addToggle(
       (t) => t.setValue(s.preload).onChange(async (v) => {
         s.preload = v;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Let Obsidian hotkeys work inside PdfCraft").setDesc("While PdfCraft has focus, your Obsidian hotkeys (like reload, command palette, switch tab) are passed to Obsidian first. PdfCraft keeps the common editing keys: find, copy, paste, undo, save, zoom.").addToggle(
-      (t) => t.setValue(s.forwardHotkeys).onChange(async (v) => {
-        s.forwardHotkeys = v;
+    new import_obsidian.Setting(containerEl).setName("Keyboard shortcuts inside PdfCraft").setDesc(
+      "Which shortcuts work while PdfCraft has focus. \u2022 Common editing keys: Obsidian hotkeys (reload, command palette, switch tab\u2026) work, but PdfCraft keeps find, copy, paste, undo, save and zoom. \u2022 PdfCraft only: every shortcut goes to PdfCraft, none to Obsidian. \u2022 Obsidian only: all Ctrl/Cmd/Alt shortcuts and F-keys go to Obsidian and PdfCraft's own shortcuts (including copy and paste) are off. Typing and the mouse still work."
+    ).addDropdown(
+      (d) => d.addOption("common", "PdfCraft keeps common editing keys").addOption("pdfcraft", "PdfCraft shortcuts only").addOption("obsidian", "Obsidian shortcuts only").setValue(s.hotkeyMode).onChange(async (v) => {
+        s.hotkeyMode = v;
+        s.forwardHotkeys = v !== "pdfcraft";
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Smooth resizing").setDesc(
+      "While you drag a pane divider, PdfCraft keeps its old size and snaps to the new size when you let go. Turn this off to let PdfCraft resize live (laggier), for example to check whether a visual glitch comes from this feature."
+    ).addToggle(
+      (t) => t.setValue(s.smoothResize !== false).onChange(async (v) => {
+        s.smoothResize = v;
         await this.plugin.saveSettings();
       })
     );
