@@ -1178,6 +1178,50 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       }
     }
   }
+  get backupDir() {
+    return (0, import_obsidian.normalizePath)(`${this.manifest.dir}/backups`);
+  }
+  async backupInfo() {
+    const ad = this.app.vault.adapter;
+    if (!await ad.exists(this.backupDir)) return { count: 0, bytes: 0 };
+    const files = (await ad.list(this.backupDir)).files;
+    let bytes = 0;
+    for (const f of files) {
+      try {
+        bytes += (await ad.stat(f))?.size || 0;
+      } catch (_) {
+      }
+    }
+    return { count: files.length, bytes };
+  }
+  async deleteAllBackups() {
+    const ad = this.app.vault.adapter;
+    if (!await ad.exists(this.backupDir)) return 0;
+    let removed = 0;
+    for (const f of (await ad.list(this.backupDir)).files) {
+      try {
+        await ad.remove(f);
+        removed++;
+      } catch (e) {
+        console.warn("PdfCraft: could not delete backup", f, e);
+      }
+    }
+    return removed;
+  }
+  async deleteVersion(version) {
+    if (!version || /[\\/]|\.\./.test(version)) throw new Error("Invalid version name.");
+    const dir = (0, import_obsidian.normalizePath)(`${this.webRoot}/${version}`);
+    const cached = this.buildCache.get(version);
+    this.buildCache.delete(version);
+    if (cached) cached.then((b) => b.urls.forEach((u) => URL.revokeObjectURL(u))).catch(() => {
+    });
+    await this.app.vault.adapter.rmdir(dir, true);
+    this.versionCache = null;
+    if (this.settings.activeVersion === version) {
+      this.settings.activeVersion = "";
+      await this.saveSettings();
+    }
+  }
   freePath(folder, name) {
     const dot = name.lastIndexOf(".");
     const stem = dot > 0 ? name.slice(0, dot) : name;
@@ -1751,6 +1795,26 @@ var PdfCraftView = class extends import_obsidian.FileView {
     fire("drop");
   }
 };
+var ConfirmModal = class extends import_obsidian.Modal {
+  constructor(app, title, message, buttonText, onConfirm) {
+    super(app);
+    this.titleText = title;
+    this.message = message;
+    this.buttonText = buttonText;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    this.titleEl.setText(this.titleText);
+    this.contentEl.createEl("p", { text: this.message });
+    new import_obsidian.Setting(this.contentEl).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close())).addButton((b) => b.setButtonText(this.buttonText).setWarning().onClick(async () => {
+      this.close();
+      await this.onConfirm();
+    }));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 var PdfCraftSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -1875,5 +1939,42 @@ var PdfCraftSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    const info = await this.plugin.backupInfo();
+    const mb = (info.bytes / 1048576).toFixed(1);
+    new import_obsidian.Setting(containerEl).setName("Delete all backups").setDesc(info.count ? `${info.count} backup file(s), about ${mb} MB. This cannot be undone.` : "No backups stored.").addButton((b) => {
+      b.setButtonText("Delete all backups").setWarning().setDisabled(!info.count).onClick(() => {
+        new ConfirmModal(this.app, "Delete all backups?", `This permanently deletes ${info.count} backup PDF(s) (${mb} MB) from the plugin's backups folder. Your PDFs in the vault are not touched.`, "Delete", async () => {
+          const n = await this.plugin.deleteAllBackups();
+          new import_obsidian.Notice(`Deleted ${n} backup(s).`);
+          void this.display();
+        }).open();
+      });
+    });
+    let chosen = versions[0] || "";
+    const delSetting = new import_obsidian.Setting(containerEl).setName("Delete an installed PdfCraft version").setDesc(versions.length ? "Permanently removes that version's folder from the plugin. PDF tabs that are already open keep working until closed." : "No versions installed.");
+    delSetting.addDropdown((d) => {
+      versions.forEach((v) => d.addOption(v, v));
+      if (chosen) d.setValue(chosen);
+      d.onChange((v) => {
+        chosen = v;
+      });
+    });
+    delSetting.addButton((b) => {
+      b.setButtonText("Delete version").setWarning().setDisabled(!versions.length).onClick(() => {
+        if (!chosen) return;
+        const only = versions.length === 1;
+        const msg = `This permanently deletes PdfCraft ${chosen} from the plugin folder.` + (only ? " It is the only version installed, so PDFs will not open in PdfCraft until you download one again." : "") + (s.activeVersion === chosen ? " It is your selected version; the plugin will fall back to the newest remaining one." : "");
+        new ConfirmModal(this.app, `Delete PdfCraft ${chosen}?`, msg, "Delete", async () => {
+          try {
+            await this.plugin.deleteVersion(chosen);
+            new import_obsidian.Notice(`Deleted PdfCraft ${chosen}.`);
+          } catch (e) {
+            console.error(e);
+            new import_obsidian.Notice("Could not delete: " + (e?.message || e), 1e4);
+          }
+          void this.display();
+        }).open();
+      });
+    });
   }
 };
