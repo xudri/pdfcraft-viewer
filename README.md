@@ -48,9 +48,10 @@ If PdfCraft cannot respond to an automatic save, the plugin shows a notice. Use 
 - **Default viewer when clicking a PDF link:** Obsidian by default. Choose the viewer for PDF links clicked inside notes.
 - **Enable PdfCraft on mobile:** off by default. While off, PDFs use Obsidian's native viewer on mobile and the PdfCraft switch action is unavailable there. This setting does not affect desktop use.
 - **Save changes automatically:** on by default. Saves after 10 seconds without input, with **Overwrite original** selected. You can turn it off and use PdfCraft's Save button.
-- **PdfCraft version in use** selects an installed web build. Reopen open PDF tabs after changing it.
+- **PdfCraft version in use** selects an installed web build. Open PDF tabs reload to use it; a tab with unsaved changes that can't be saved automatically is left as it is.
 - **Download latest** fetches the newest web build from the upstream PdfCraft GitHub release. It does not remove older builds or change an already installed active version.
-- **Renderer** can use WebGL2 if automatic rendering is slow on your computer.
+- **Check for PdfCraft updates:** on by default. Once a day, shortly after startup, asks GitHub whether a newer web build exists and shows a notice with a download link. Nothing is downloaded until you click it.
+- **Renderer** can use WebGL2 if automatic rendering is slow on your computer. Open PDF tabs reload to use it.
 - **Preload PdfCraft at startup** loads its files into memory after Obsidian starts. This can make the first PDF open faster and uses roughly 40 MB of memory.
 - **Let Obsidian hotkeys work inside PdfCraft** forwards many Obsidian shortcuts while the viewer has focus. See the keyboard note above.
 - **When saving** chooses whether to overwrite the open PDF or save an edited copy. When overwriting, the plugin keeps the last 10 backups in `pdfcraft-viewer/backups/` by default.

@@ -29,77 +29,8 @@ var import_obsidian = require("obsidian");
 var u8 = Uint8Array;
 var u16 = Uint16Array;
 var i32 = Int32Array;
-var fleb = new u8([
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  0,
-  1,
-  1,
-  1,
-  1,
-  2,
-  2,
-  2,
-  2,
-  3,
-  3,
-  3,
-  3,
-  4,
-  4,
-  4,
-  4,
-  5,
-  5,
-  5,
-  5,
-  0,
-  /* unused */
-  0,
-  0,
-  /* impossible */
-  0
-]);
-var fdeb = new u8([
-  0,
-  0,
-  0,
-  0,
-  1,
-  1,
-  2,
-  2,
-  3,
-  3,
-  4,
-  4,
-  5,
-  5,
-  6,
-  6,
-  7,
-  7,
-  8,
-  8,
-  9,
-  9,
-  10,
-  10,
-  11,
-  11,
-  12,
-  12,
-  13,
-  13,
-  /* unused */
-  0,
-  0
-]);
+var fleb = new u8([0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0, /* unused */ 0, 0, /* impossible */ 0]);
+var fdeb = new u8([0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, /* unused */ 0, 0]);
 var clim = new u8([16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]);
 var freb = function(eb, start) {
   var b = new u16(31);
@@ -169,20 +100,15 @@ var hMap = (function(cd, mb, r) {
 var flt = new u8(288);
 for (i = 0; i < 144; ++i)
   flt[i] = 8;
-var i;
 for (i = 144; i < 256; ++i)
   flt[i] = 9;
-var i;
 for (i = 256; i < 280; ++i)
   flt[i] = 7;
-var i;
 for (i = 280; i < 288; ++i)
   flt[i] = 8;
-var i;
 var fdt = new u8(32);
 for (i = 0; i < 32; ++i)
   fdt[i] = 5;
-var i;
 var flrm = /* @__PURE__ */ hMap(flt, 9, 1);
 var fdrm = /* @__PURE__ */ hMap(fdt, 5, 1);
 var max = function(a) {
@@ -514,7 +440,9 @@ var DEFAULTS = {
   smoothResize: true,
   enableOnMobile: false,
   linkViewer: "native",
-  autoSave: true
+  autoSave: true,
+  checkUpdates: true,
+  lastUpdateCheck: 0
 };
 var sleep = (ms) => new Promise((r) => window.setTimeout(r, ms));
 function cmpVersion(a, b) {
@@ -580,7 +508,13 @@ function makeHook(renderer, startupUrl = null) {
   var origRevoke = URL.revokeObjectURL.bind(URL);
   URL.createObjectURL = function (obj) {
     var u = origCreate(obj);
-    try { if (obj instanceof Blob) blobs.set(u, obj); } catch (e) {}
+    try {
+      if (obj instanceof Blob) {
+        blobs.set(u, obj);
+        // Keep only the newest few, so unrevoked blob URLs (images, fonts...) can't pile up in memory.
+        if (blobs.size > 32) blobs.delete(blobs.keys().next().value);
+      }
+    } catch (e) {}
     return u;
   };
   URL.revokeObjectURL = function (url) {
@@ -644,15 +578,30 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
         cancelable: true,
         composed: true
       });
-      document.body.dispatchEvent(ev);
+      // Send it to the window that holds the PdfCraft tab, so popout windows get their own hotkeys.
+      let doc = document;
+      try {
+        doc = e.view?.parent?.document || document;
+      } catch (_) {
+      }
+      doc.body.dispatchEvent(ev);
       return mode === "obsidian" ? true : ev.defaultPrevented;
     };
     this.lastNativePage = /* @__PURE__ */ new Map();
+    this.keyWindows = /* @__PURE__ */ new Set();
+  }
+  /** The PdfCraft page asks its parent window for this function, so every Obsidian window needs it. */
+  exposeForwardKey(win) {
+    if (!win) return;
+    win.__pdfcraftForwardKey = this.forwardKey;
+    this.keyWindows.add(win);
   }
   /* ---------------------------- lifecycle ---------------------------- */
   async onload() {
     await this.loadSettings();
-    window.__pdfcraftForwardKey = this.forwardKey;
+    this.exposeForwardKey(window);
+    this.registerEvent(this.app.workspace.on("window-open", (_workspaceWindow, win) => this.exposeForwardKey(win)));
+    this.registerEvent(this.app.workspace.on("window-close", (_workspaceWindow, win) => this.keyWindows.delete(win)));
     this.registerView(VIEW_TYPE, (leaf) => new PdfCraftView(leaf, this));
     this.addCommand({
       id: "open-current-pdf",
@@ -680,7 +629,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       id: "open-current-pdf-with-default-app",
       name: "Open current PDF with default app",
       checkCallback: (checking) => {
-        if (!import_obsidian.Platform.isDesktopApp || !import_obsidian.Platform.isWin) return false;
+        if (!import_obsidian.Platform.isDesktopApp) return false;
         const leaf = this.app.workspace.activeLeaf;
         if (!this.pdfFileInLeaf(leaf)) return false;
         if (!checking) void this.openInDefaultApp(leaf);
@@ -724,6 +673,10 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
           "PdfCraft Viewer: no PdfCraft build found. Run the command \u201CDownload latest PdfCraft web build\u201D.",
           1e4
         );
+      } else if (this.settings.checkUpdates) {
+        // Wait a little, so the check never competes with opening the vault.
+        const updateTimer = window.setTimeout(() => void this.checkForUpdate().catch(() => {}), 15e3);
+        this.register(() => window.clearTimeout(updateTimer));
       }
     });
   }
@@ -734,7 +687,13 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     this.versionCache = null;
     for (const buttons of this.nativeActions.values()) buttons.forEach((button) => button.remove());
     this.nativeActions.clear();
-    delete window.__pdfcraftForwardKey;
+    for (const win of this.keyWindows) {
+      try {
+        delete win.__pdfcraftForwardKey;
+      } catch (_) {
+      }
+    }
+    this.keyWindows.clear();
     if (this.tookOver) this.applyTakeover(false);
     this.releaseBuilds();
   }
@@ -756,6 +715,20 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       if (this.settings.autoSave && this.settings.saveMode === "overwrite") view.scheduleAutoSave();
       else view.clearAutoSaveTimers();
     }
+  }
+  /** Reloads open PdfCraft tabs whose version or renderer no longer matches the settings. */
+  async reloadOutdatedViews() {
+    const version = await this.resolveVersion();
+    const renderer = this.settings.renderer;
+    const views = this.app.workspace.getLeavesOfType(VIEW_TYPE).map((leaf) => leaf.view).filter((view) => view instanceof PdfCraftView);
+    await Promise.all(views.map(async (view) => {
+      if (view.loadedVersion === version && view.loadedRenderer === renderer) return;
+      try {
+        await view.reloadPdf();
+      } catch (error) {
+        console.error("PdfCraft Viewer: could not reload a PDF tab", error);
+      }
+    }));
   }
   get enabledHere() {
     return !import_obsidian.Platform.isMobile || this.settings.enableOnMobile;
@@ -882,7 +855,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     }
   }
   async openInDefaultApp(leaf) {
-    if (!import_obsidian.Platform.isDesktopApp || !import_obsidian.Platform.isWin) return;
+    if (!import_obsidian.Platform.isDesktopApp) return;
     const file = this.pdfFileInLeaf(leaf);
     if (!file) return;
     const view = leaf.view;
@@ -895,35 +868,15 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     }
     const adapter = this.app.vault.adapter;
     if (!(adapter instanceof import_obsidian.FileSystemAdapter)) {
-      new import_obsidian.Notice("Opening in the default app is available only for local Windows vaults.");
+      new import_obsidian.Notice("Opening in the default app is available only for local vaults.");
       return;
     }
     try {
-      const { spawn } = require("node:child_process");
-      const { Buffer } = require("node:buffer");
-      const fullPath = adapter.getFullPath(file.path);
-      const path64 = Buffer.from(fullPath, "utf16le").toString("base64");
-      const script = `$ErrorActionPreference='Stop'; $pdf=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${path64}')); Start-Process -FilePath $pdf`;
-      const command64 = Buffer.from(script, "utf16le").toString("base64");
-      const child = spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", command64], {
-        windowsHide: true,
-        stdio: ["ignore", "ignore", "pipe"]
-      });
-      let errorText = "";
-      let launchFailed = false;
-      child.stderr.on("data", (chunk) => {
-        if (errorText.length < 2e3) errorText += String(chunk).slice(0, 2e3 - errorText.length);
-      });
-      child.on("error", (error) => {
-        launchFailed = true;
-        console.error("PdfCraft Viewer: could not open PDF in default app", error);
-        new import_obsidian.Notice("Could not open the PDF in the default app.");
-      });
-      child.on("close", (code) => {
-        if (launchFailed || code === 0) return;
-        console.error("PdfCraft Viewer: default PDF app launch failed", errorText || `Exit code ${code}`);
-        new import_obsidian.Notice("Could not open the PDF in the default app.");
-      });
+      // Electron's shell opens the file with the system's default app on Windows, macOS and Linux.
+      const shell = require("electron")?.shell;
+      if (typeof shell?.openPath !== "function") throw new Error("Electron shell unavailable");
+      const problem = await shell.openPath(adapter.getFullPath(file.path));
+      if (problem) throw new Error(problem);
     } catch (error) {
       console.error("PdfCraft Viewer: could not open PDF in default app", error);
       new import_obsidian.Notice("Could not open the PDF in the default app.");
@@ -945,7 +898,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
         if (!button) continue;
         button.setAttribute("aria-label", "Open in PdfCraft");
         const buttons = [button];
-        if (import_obsidian.Platform.isDesktopApp && import_obsidian.Platform.isWin) {
+        if (import_obsidian.Platform.isDesktopApp) {
           const defaultApp = view.addAction("file-output", "Open with default PDF app", () => void this.openInDefaultApp(view.leaf));
           if (defaultApp) {
             defaultApp.setAttribute("aria-label", "Open with default PDF app");
@@ -1080,7 +1033,18 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       ad.readBinary(`${base}/${jsName}`),
       ad.readBinary(`${base}/${wasmName}`)
     ]);
-    const jsUrl = URL.createObjectURL(new Blob([jsBytes], { type: "text/javascript" }));
+    // Newer builds import small helper modules by relative path (./snippets/...). A blob: script cannot resolve
+    // relative paths, so load each helper as its own blob and point the import at it.
+    let jsSource = new TextDecoder().decode(jsBytes);
+    const snippetPaths = [...new Set([...jsSource.matchAll(/["'](\.\/snippets\/[^"']+\.js)["']/g)].map((m) => m[1]))];
+    const snippetData = await Promise.all(snippetPaths.map((rel) => ad.readBinary((0, import_obsidian.normalizePath)(`${base}/${rel.slice(2)}`))));
+    const snippetUrlOf = new Map(snippetPaths.map((rel, i2) => [rel, URL.createObjectURL(new Blob([snippetData[i2]], { type: "text/javascript" }))]));
+    const snippetUrls = [...snippetUrlOf.values()];
+    // Only the import statements change. The same text is also the key of the WebAssembly import table and must stay.
+    if (snippetPaths.length) {
+      jsSource = jsSource.replace(/(from\s*)(["'])(\.\/snippets\/[^"']+\.js)\2/g, (m, pre, q, path) => snippetUrlOf.has(path) ? pre + q + snippetUrlOf.get(path) + q : m);
+    }
+    const jsUrl = URL.createObjectURL(new Blob([snippetPaths.length ? jsSource : jsBytes], { type: "text/javascript" }));
     const wasmUrl = URL.createObjectURL(new Blob([wasmBytes], { type: "application/wasm" }));
     html = html.replace(/<link[^>]+rel=["'](?:modulepreload|preload)["'][^>]*>/g, "");
     html = html.split(`./${jsName}`).join(jsUrl).split(`./${wasmName}`).join(wasmUrl);
@@ -1098,7 +1062,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       return compiled;
     }).catch(() => null) : Promise.resolve(null);
     html = html.replace(/<head>/i, "<head><!--PDFCRAFT_HOOK-->");
-    return { template: html, urls: [jsUrl, wasmUrl], modulePromise,
+    return { template: html, urls: [jsUrl, wasmUrl, ...snippetUrls], modulePromise,
       directOpen: cmpVersion(version, "0.10.1") >= 0 };
   }
   /* ------------------------------ updates ------------------------------ */
@@ -1111,19 +1075,49 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       if (!await ad.exists(cur)) await ad.mkdir(cur);
     }
   }
+  /** Asks GitHub for the newest release that has a web build. */
+  async fetchLatestRelease() {
+    const rel = await (0, import_obsidian.requestUrl)({
+      url: REPO_API,
+      headers: { Accept: "application/vnd.github+json" }
+    });
+    const tag = String(rel.json?.tag_name || "");
+    if (!tag) throw new Error("GitHub did not return a release.");
+    const asset = (rel.json.assets || []).find((a) => /^pdfcraft-web-.*\.zip$/.test(a.name));
+    if (!asset) throw new Error("No web build found in release " + tag);
+    return { version: tag.replace(/^v/, ""), asset };
+  }
+  /** At most once a day: tell the user when GitHub has a PdfCraft build newer than every installed one. */
+  async checkForUpdate() {
+    if (!this.settings.checkUpdates || Date.now() - (this.settings.lastUpdateCheck || 0) < 864e5) return;
+    this.settings.lastUpdateCheck = Date.now();
+    await this.saveData(this.settings);
+    const installed = await this.listVersions();
+    if (!installed.length) return;
+    let latest;
+    try {
+      latest = (await this.fetchLatestRelease()).version;
+    } catch (error) {
+      console.warn("PdfCraft Viewer: update check failed", error);
+      return;
+    }
+    if (this.disposed || installed.includes(latest) || cmpVersion(latest, installed[0]) <= 0) return;
+    const message = createFragment((frag) => {
+      frag.appendText(`PdfCraft ${latest} is available (newest installed: ${installed[0]}). `);
+      frag.createEl("a", { text: "Download it", href: "#" }).addEventListener("click", (event) => {
+        event.preventDefault();
+        notice.hide();
+        void this.downloadLatest();
+      });
+    });
+    const notice = new import_obsidian.Notice(message, 15e3);
+  }
   /** Downloads the newest release into its own folder. Does NOT switch to it. */
   async downloadLatest() {
     try {
       const currentVersion = await this.resolveVersion();
       new import_obsidian.Notice("PdfCraft: checking GitHub for the latest release\u2026");
-      const rel = await (0, import_obsidian.requestUrl)({
-        url: REPO_API,
-        headers: { Accept: "application/vnd.github+json" }
-      });
-      const tag = rel.json.tag_name;
-      const version = tag.replace(/^v/, "");
-      const asset = (rel.json.assets || []).find((a) => /^pdfcraft-web-.*\.zip$/.test(a.name));
-      if (!asset) throw new Error("No web build found in release " + tag);
+      const { version, asset } = await this.fetchLatestRelease();
       if ((await this.listVersions()).includes(version)) {
         new import_obsidian.Notice(`PdfCraft ${version} is already installed.`);
         return version;
@@ -1136,6 +1130,10 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       const top = names[0].split("/")[0] + "/";
       const stripTop = names.every((n) => n.startsWith(top));
       const dest = (0, import_obsidian.normalizePath)(`${this.webRoot}/${version}`);
+      // A folder only counts as an installed version once its index.html exists, so write that last.
+      // Then a download that fails halfway is never picked as the newest version.
+      const isIndex = (n) => (stripTop ? n.slice(top.length) : n) === "index.html";
+      names.sort((a, b) => isIndex(a) - isIndex(b));
       for (const n of names) {
         const rel2 = stripTop ? n.slice(top.length) : n;
         if (!rel2 || rel2.includes("..")) continue;
@@ -1165,7 +1163,7 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
   }
   /* ------------------------------ saving ------------------------------ */
   async backup(file) {
-    const dir = (0, import_obsidian.normalizePath)(`${this.manifest.dir}/backups`);
+    const dir = this.backupDir;
     await this.ensureDir(dir);
     const data = await this.app.vault.readBinary(file);
     await this.app.vault.adapter.writeBinary(`${dir}/${Date.now()}-${file.name}`, data);
@@ -1221,6 +1219,8 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       this.settings.activeVersion = "";
       await this.saveSettings();
     }
+    // Tabs still running the deleted version would break on their next reload (moving a pane), so move them now.
+    await this.reloadOutdatedViews();
   }
   freePath(folder, name) {
     const dot = name.lastIndexOf(".");
@@ -1307,7 +1307,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
     await super.onOpen();
     const switchButton = this.addAction("refresh-cw", "Open in Obsidian PDF viewer", () => void this.plugin.switchLeafViewer(this.leaf));
     switchButton?.setAttribute("aria-label", "Open in Obsidian PDF viewer");
-    if (import_obsidian.Platform.isDesktopApp && import_obsidian.Platform.isWin) {
+    if (import_obsidian.Platform.isDesktopApp) {
       const defaultApp = this.addAction("file-output", "Open with default PDF app", () => void this.plugin.openInDefaultApp(this.leaf));
       defaultApp?.setAttribute("aria-label", "Open with default PDF app");
     }
@@ -1344,6 +1344,19 @@ var PdfCraftView = class extends import_obsidian.FileView {
       if (this.loadRequest === request) this.loadRequest = null;
     }
   }
+  /** Restarts PdfCraft on the same PDF, so a new version or renderer applies. Unsaved changes are saved first, or the tab is left alone. */
+  async reloadPdf() {
+    const file = this.file;
+    if (!file || !this.iframe && this.loadedVersion === void 0) return;
+    if (this.dirty) {
+      const canSave = this.plugin.settings.autoSave && this.plugin.settings.saveMode === "overwrite" && this.hostReady;
+      if (!canSave || !await this.flushAutoSaveBeforeClose()) {
+        new import_obsidian.Notice(`PdfCraft: ${file.name} has unsaved changes, so it was not reloaded. Save it, then reopen it to apply the change.`, 1e4);
+        return;
+      }
+    }
+    await this.startPdfCraftFile(file);
+  }
   fileLoadKey(file) {
     return JSON.stringify([file.path, file.stat?.mtime, file.stat?.size, this.plugin.settings.renderer, this.plugin.settings.activeVersion]);
   }
@@ -1360,6 +1373,8 @@ var PdfCraftView = class extends import_obsidian.FileView {
     }
     const version = await this.plugin.resolveVersion();
     if (loadGeneration !== this.loadGeneration) return;
+    this.loadedVersion = version;
+    this.loadedRenderer = this.plugin.settings.renderer;
     if (!version) {
       this.contentEl.createDiv({
         cls: "pdfcraft-msg",
@@ -1447,7 +1462,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
         }
       }, 5e3);
       status.setText("Opening " + file.name + "\u2026");
-      this.revealWhenOpened(iframe, status, bytes.byteLength, loadGeneration);
+      this.revealWhenOpened(iframe, status, loadGeneration);
       this.focusApp();
     } catch (e) {
       if (loadGeneration !== this.loadGeneration) return;
@@ -1519,7 +1534,10 @@ var PdfCraftView = class extends import_obsidian.FileView {
   }
   async flushAutoSaveBeforeClose() {
     if (!this.dirty) return true;
-    if (!this.plugin.settings.autoSave || this.plugin.settings.saveMode !== "overwrite") return false;
+    if (!this.plugin.settings.autoSave || this.plugin.settings.saveMode !== "overwrite") {
+      new import_obsidian.Notice(`PdfCraft: unsaved changes in ${this.file?.name || "this PDF"} were not saved, because automatic saving is off. Use PdfCraft's Save button before leaving a PDF.`, 1e4);
+      return false;
+    }
     if (!this.hostReady) {
       new import_obsidian.Notice("PdfCraft still has unsaved changes; this web build did not expose automatic saving. Use PdfCraft's Save button before closing.", 1e4);
       return false;
@@ -1577,6 +1595,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
   attachResizeFreeze(iframe) {
     this.detachResizeFreeze();
     const host = this.contentEl;
+    const win = host.ownerDocument.defaultView || window;
     let frozen = false;
     let animating = false;
     let settled = { w: 0, h: 0 };
@@ -1602,9 +1621,10 @@ var PdfCraftView = class extends import_obsidian.FileView {
       window.clearTimeout(upTimer);
       animating = false;
       frozen = false;
+      unwatchRelease();
       clearFrame();
     };
-    const reduceMotion = () => window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const reduceMotion = () => win.matchMedia && win.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const snap = () => {
       if (!frozen || animating) return;
       const w = host.clientWidth;
@@ -1633,6 +1653,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
       st.height = h + "px";
       st.pointerEvents = "none"; // lets the mouse-release reach Obsidian even over the frame
       maxTimer = window.setTimeout(snap, 8e3); // safety net: never stay frozen
+      watchRelease();
     };
     const onDown = (e) => {
       const target = e && e.target;
@@ -1647,19 +1668,25 @@ var PdfCraftView = class extends import_obsidian.FileView {
     const onMove = (e) => {
       if (frozen && !animating && e.buttons === 0) onUp(); // the mouse-up was missed
     };
-    window.addEventListener("pointerdown", onDown, true);
-    window.addEventListener("pointerup", onUp, true);
-    window.addEventListener("pointercancel", onUp, true);
-    window.addEventListener("pointermove", onMove, true);
+    // Release and move listeners exist only while a divider is held, so ordinary mouse moves cost nothing.
+    function watchRelease() {
+      win.addEventListener("pointerup", onUp, true);
+      win.addEventListener("pointercancel", onUp, true);
+      win.addEventListener("pointermove", onMove, true);
+    }
+    function unwatchRelease() {
+      win.removeEventListener("pointerup", onUp, true);
+      win.removeEventListener("pointercancel", onUp, true);
+      win.removeEventListener("pointermove", onMove, true);
+    }
+    win.addEventListener("pointerdown", onDown, true);
     this.resizeFreeze = {
       cleanup: () => {
         window.clearTimeout(animTimer);
         window.clearTimeout(maxTimer);
         window.clearTimeout(upTimer);
-        window.removeEventListener("pointerdown", onDown, true);
-        window.removeEventListener("pointerup", onUp, true);
-        window.removeEventListener("pointercancel", onUp, true);
-        window.removeEventListener("pointermove", onMove, true);
+        win.removeEventListener("pointerdown", onDown, true);
+        unwatchRelease();
         clearFrame();
       }
     };
@@ -1670,7 +1697,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
     this.resizeFreeze = null;
   }
   /** Reveal on the next browser paint, without an arbitrary file-size-based delay. */
-  revealWhenOpened(iframe, status, _size, generation) {
+  revealWhenOpened(iframe, status, generation) {
     const win = iframe.ownerDocument.defaultView;
     win.requestAnimationFrame(() => {
       if (generation !== this.loadGeneration || this.iframe !== iframe) return;
@@ -1704,7 +1731,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
         return;
       }
       if (bytes) this.dropFile(iframe, file.name, bytes);
-      this.revealWhenOpened(iframe, status, bytes?.byteLength || 0, generation);
+      this.revealWhenOpened(iframe, status, generation);
       this.focusApp();
       if (hadUnsaved) {
         new import_obsidian.Notice("PdfCraft reloaded after the layout change. Edits made in the last few seconds before it were not saved.", 1e4);
@@ -1772,10 +1799,8 @@ var PdfCraftView = class extends import_obsidian.FileView {
         if (c && (c.width !== 300 || c.height !== 150)) {
           // Canvas resizing can precede app construction. Bridge-capable builds
           // must finish constructing their app before we reveal or send anything.
-          if (!this.startupOpen) {
-            await sleep(400);
-            return isCurrent();
-          }
+          await sleep(400);
+          return isCurrent();
         }
       } catch (_) {
       }
@@ -1876,12 +1901,13 @@ var PdfCraftSettingTab = class extends import_obsidian.PluginSettingTab {
       })
     );
     const versions = await this.plugin.listVersions();
-    new import_obsidian.Setting(containerEl).setName("PdfCraft version in use").setDesc("Old versions are kept, so you can switch back if a new one misbehaves. Reopen your PDF tabs after changing.").addDropdown((d) => {
+    new import_obsidian.Setting(containerEl).setName("PdfCraft version in use").setDesc("Old versions are kept, so you can switch back if a new one misbehaves. Open PDF tabs reload to use the new version (a tab with unsaved changes it can't save is left as it is).").addDropdown((d) => {
       d.addOption("", versions.length ? `Newest installed (${versions[0]})` : "None installed");
       versions.forEach((v) => d.addOption(v, v));
       d.setValue(s.activeVersion).onChange(async (v) => {
         s.activeVersion = v;
         await this.plugin.saveSettings();
+        await this.plugin.reloadOutdatedViews();
       });
     });
     new import_obsidian.Setting(containerEl).setName("Get a newer PdfCraft").setDesc("Downloads the latest web build from GitHub next to the old ones. It is not activated until you pick it above. You can also unzip a web build by hand into the plugin's pdfcraft-web folder, in its own sub-folder.").addButton(
@@ -1890,10 +1916,17 @@ var PdfCraftSettingTab = class extends import_obsidian.PluginSettingTab {
         this.display();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Renderer").setDesc("If PdfCraft feels laggy, try \u201CWebGL2\u201D: it stops PdfCraft from using WebGPU, which can be slow or software-emulated on some computers. Reopen your PDF tabs after changing.").addDropdown(
+    new import_obsidian.Setting(containerEl).setName("Check for PdfCraft updates").setDesc("Once a day at startup, asks GitHub whether a newer PdfCraft web build exists and shows a notice if so. Nothing is downloaded until you choose to.").addToggle(
+      (t) => t.setValue(s.checkUpdates).onChange(async (v) => {
+        s.checkUpdates = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Renderer").setDesc("If PdfCraft feels laggy, try \u201CWebGL2\u201D: it stops PdfCraft from using WebGPU, which can be slow or software-emulated on some computers. Open PDF tabs reload to use it.").addDropdown(
       (d) => d.addOption("auto", "Automatic (default)").addOption("webgl", "WebGL2").setValue(s.renderer).onChange(async (v) => {
         s.renderer = v;
         await this.plugin.saveSettings();
+        await this.plugin.reloadOutdatedViews();
       })
     );
     new import_obsidian.Setting(containerEl).setName("Preload PdfCraft at startup").setDesc("Loads and compiles the PdfCraft engine a few seconds after startup. Later PDF tabs reuse the compiled engine. Uses additional memory.").addToggle(
@@ -1951,7 +1984,7 @@ var PdfCraftSettingTab = class extends import_obsidian.PluginSettingTab {
       });
     });
     let chosen = versions[0] || "";
-    const delSetting = new import_obsidian.Setting(containerEl).setName("Delete an installed PdfCraft version").setDesc(versions.length ? "Permanently removes that version's folder from the plugin. PDF tabs that are already open keep working until closed." : "No versions installed.");
+    const delSetting = new import_obsidian.Setting(containerEl).setName("Delete an installed PdfCraft version").setDesc(versions.length ? "Permanently removes that version's folder from the plugin. Open PDF tabs using it reload with the version selected above." : "No versions installed.");
     delSetting.addDropdown((d) => {
       versions.forEach((v) => d.addOption(v, v));
       if (chosen) d.setValue(chosen);
