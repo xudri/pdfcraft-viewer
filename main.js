@@ -457,6 +457,27 @@ function cmpVersion(a, b) {
 function makeHook(renderer, startupUrl = null) {
   return `<script>
 (function () {
+  // When a modal (quick switcher, command palette...) closes, Obsidian returns focus to the element that had it,
+  // here the PdfCraft canvas. It checks that element with helpers Obsidian adds only to its own window's nodes,
+  // so without these the close throws and the chosen item is never opened.
+  if (!("doc" in Node.prototype)) {
+    Object.defineProperty(Node.prototype, "doc", { configurable: true, get: function () { return this.ownerDocument || document; } });
+  }
+  if (!("win" in Node.prototype)) {
+    Object.defineProperty(Node.prototype, "win", { configurable: true, get: function () { return this.doc.defaultView || window; } });
+  }
+  if (typeof Node.prototype.instanceOf !== "function") {
+    Object.defineProperty(Node.prototype, "instanceOf", { configurable: true, writable: true, value: function (type) {
+      if (this instanceof type) return true;
+      var own = type && (this.ownerDocument && this.ownerDocument.defaultView || window)[type.name];
+      return !!(own && this instanceof own);
+    } });
+  }
+  if (typeof Element.prototype.hasClass !== "function") {
+    Object.defineProperty(Element.prototype, "hasClass", { configurable: true, writable: true, value: function (cls) {
+      return this.classList.contains(cls);
+    } });
+  }
   if (${JSON.stringify(renderer)} === "webgl") {
     try { delete Navigator.prototype.gpu; } catch (e) {}
     try { Object.defineProperty(navigator, "gpu", { get: function () { return undefined; }, configurable: true }); } catch (e) {}
