@@ -504,6 +504,14 @@ function makeHook(renderer, startupUrl = null) {
       return originalFetch(input, options);
     };
   }
+  // Same-document bridge (data-host="page"): the app fires non-bubbling events on its canvas. A capturing listener
+  // on the window still sees them; send them to the plugin as the same messages the ?host=parent bridge posts.
+  ["ready", "save", "dirty", "failed"].forEach(function (kind) {
+    window.addEventListener("pdfcraft:" + kind, function (event) {
+      if (!event.target || event.target.id !== "pdfcraft") return;
+      window.parent.postMessage(Object.assign({}, event.detail || {}, { type: "pdfcraft:" + kind }), location.origin);
+    }, true);
+  });
   window.__pdfcraftRequestSave = function () {
     var canvas = document.getElementById("pdfcraft");
     if (!canvas) return false;
@@ -1083,6 +1091,10 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
       return compiled;
     }).catch(() => null) : Promise.resolve(null);
     html = html.replace(/<head>/i, "<head><!--PDFCRAFT_HOOK-->");
+    // Builds using craft-web-host (0.19.0+) turn on ?host=parent only when the real address carries it, and a
+    // blob: page can't. They also offer a same-document bridge on the canvas, which the hook passes on to the plugin.
+    // Older builds ignore the attribute and keep using the ?host=parent the hook supplies.
+    html = html.replace(/<canvas\b(?=[^>]*\bid=["']pdfcraft["'])(?![^>]*\bdata-host=)/i, '<canvas data-host="page"');
     return { template: html, urls: [jsUrl, wasmUrl, ...snippetUrls], modulePromise,
       directOpen: cmpVersion(version, "0.10.1") >= 0 };
   }
