@@ -493,16 +493,34 @@ function makeHook(renderer, startupUrl = null) {
   // Supply the prepared bytes immediately on first startup, and read the latest
   // vault contents if moving an Obsidian pane reloads this page.
   var startupUrl = ${JSON.stringify(startupUrl)};
-  if (startupUrl) {
-    var originalFetch = window.fetch.bind(window);
-    window.fetch = function (input, options) {
-      if (input === startupUrl && window.frameElement?.__pdfcraftReadStartup) {
-        return window.frameElement.__pdfcraftReadStartup().then(function (bytes) {
-          return new Response(bytes, { headers: { "Content-Type": "application/pdf" } });
-        });
-      }
-      return originalFetch(input, options);
+  // A blob: page has no folder, so relative URLs (OCR models, 0.21.0+) can't resolve; the plugin reads them instead.
+  var originalFetch = window.fetch.bind(window);
+  window.fetch = function (input, options) {
+    var frame = window.frameElement;
+    if (startupUrl && input === startupUrl && frame?.__pdfcraftReadStartup) {
+      return frame.__pdfcraftReadStartup().then(function (bytes) {
+        return new Response(bytes, { headers: { "Content-Type": "application/pdf" } });
+      });
+    }
+    var url = typeof input === "string" ? input : input && input.url;
+    var model = typeof url === "string" && /^(?:\\.\\/)?models\\/([\\w.-]+)$/.exec(url);
+    if (model && frame?.__pdfcraftReadModel) {
+      return frame.__pdfcraftReadModel(model[1]).then(function (bytes) {
+        return new Response(bytes, { headers: { "Content-Type": "application/octet-stream" } });
+      });
+    }
+    return originalFetch(input, options);
+  };
+  // The OCR worker is named by a relative URL in a <meta> tag; start the plugin's blob copy of it instead.
+  var NativeWorker = window.Worker;
+  if (NativeWorker) {
+    window.Worker = function (url, options) {
+      var ocr = window.frameElement?.__pdfcraftOcrWorker;
+      var name = String(url);
+      if (ocr && name.slice(-ocr.name.length - 1) === "/" + ocr.name) url = ocr.url;
+      return new NativeWorker(url, options);
     };
+    window.Worker.prototype = NativeWorker.prototype;
   }
   // Same-document bridge (data-host="page"): the app fires non-bubbling events on its canvas. A capturing listener
   // on the window still sees them; send them to the plugin as the same messages the ?host=parent bridge posts.
@@ -1051,8 +1069,26 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     }
     return p;
   }
-  async loadBuild(version) {
+  /** Cloud-synced vaults (Google Drive, OneDrive...) can time out reading a file that is still syncing. Retry those reads. */
+  async readRetrying(read) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await read();
+      } catch (error) {
+        if (attempt >= 4 || !["ETIMEDOUT", "EBUSY", "EAGAIN"].includes(error?.code)) throw error;
+        await sleep(1500 * attempt);
+      }
+    }
+  }
+  get syncSafeAdapter() {
     const ad = this.app.vault.adapter;
+    return {
+      read: (path) => this.readRetrying(() => ad.read(path)),
+      readBinary: (path) => this.readRetrying(() => ad.readBinary(path))
+    };
+  }
+  async loadBuild(version) {
+    const ad = this.syncSafeAdapter;
     const base = (0, import_obsidian.normalizePath)(`${this.webRoot}/${version}`);
     let html = await ad.read(`${base}/index.html`);
     const jsName = (html.match(/['"]\.\/([^'"]+\.js)['"]/) || [])[1];
@@ -1095,8 +1131,35 @@ var _PdfCraftPlugin = class _PdfCraftPlugin extends import_obsidian.Plugin {
     // blob: page can't. They also offer a same-document bridge on the canvas, which the hook passes on to the plugin.
     // Older builds ignore the attribute and keep using the ?host=parent the hook supplies.
     html = html.replace(/<canvas\b(?=[^>]*\bid=["']pdfcraft["'])(?![^>]*\bdata-host=)/i, '<canvas data-host="page"');
-    return { template: html, urls: [jsUrl, wasmUrl, ...snippetUrls], modulePromise,
+    // 0.21.0+ runs OCR in a module worker named by a <meta> tag. Without it PdfCraft still opens PDFs, so a failure here only costs OCR.
+    let ocrWorker = null;
+    const ocrLoader = (html.match(/<meta[^>]*name=["']pdfcraft-ocr-worker["'][^>]*content=["']\.\/([^"'/]+\.js)["']/i) || [])[1];
+    if (ocrLoader) {
+      try {
+        ocrWorker = await this.loadOcrWorker(base, ocrLoader);
+      } catch (error) {
+        console.warn("PdfCraft Viewer: OCR worker unavailable", error);
+      }
+    }
+    return { template: html, urls: [jsUrl, wasmUrl, ...snippetUrls, ...ocrWorker?.urls || []], modulePromise,
+      ocrWorker: ocrWorker && { name: ocrLoader, url: ocrWorker.url },
       directOpen: cmpVersion(version, "0.10.1") >= 0 };
+  }
+  /** The OCR worker loads its script and WASM by relative paths, which a blob: worker can't resolve, so each file
+   *  becomes its own blob and the references point at those. Returns the loader's blob URL. */
+  async loadOcrWorker(base, loaderName) {
+    const ad = this.syncSafeAdapter;
+    const loader = await ad.read(`${base}/${loaderName}`);
+    const scriptName = (loader.match(/from\s*["']\.\/([^"'/]+\.js)["']/) || [])[1];
+    if (!scriptName) throw new Error("Unrecognised OCR worker loader.");
+    let script = await ad.read(`${base}/${scriptName}`);
+    const wasmName = (script.match(/new URL\(\s*["']([^"'/]+\.wasm)["']\s*,\s*import\.meta\.url\s*\)/) || [])[1];
+    if (!wasmName) throw new Error("Unrecognised OCR worker script.");
+    const wasmUrl = URL.createObjectURL(new Blob([await ad.readBinary(`${base}/${wasmName}`)], { type: "application/wasm" }));
+    script = script.replace(/new URL\(\s*["'][^"'/]+\.wasm["']\s*,\s*import\.meta\.url\s*\)/g, `new URL(${JSON.stringify(wasmUrl)})`);
+    const scriptUrl = URL.createObjectURL(new Blob([script], { type: "text/javascript" }));
+    const loaderUrl = URL.createObjectURL(new Blob([loader.split(`./${scriptName}`).join(scriptUrl)], { type: "text/javascript" }));
+    return { url: loaderUrl, urls: [loaderUrl, scriptUrl, wasmUrl] };
   }
   /* ------------------------------ updates ------------------------------ */
   async ensureDir(path) {
@@ -1454,7 +1517,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
       this.messageWindow = iframe.ownerDocument.defaultView;
       this.messageWindow.addEventListener("message", this.msgHandler);
       const [build, bytes] = await Promise.all([
-        this.plugin.getBuild(version), this.app.vault.readBinary(file)
+        this.plugin.getBuild(version), this.plugin.readRetrying(() => this.app.vault.readBinary(file))
       ]);
       if (loadGeneration !== this.loadGeneration) return;
       // The private URL preserves the exact filename for PdfCraft's startup loader.
@@ -1462,6 +1525,13 @@ var PdfCraftView = class extends import_obsidian.FileView {
       this.startupOpen = build.directOpen && !file.name.includes("?");
       const startupUrl = this.startupOpen ? "pdfcraft-vault://document/" + file.name : null;
       iframe.__pdfcraftModule = build.modulePromise;
+      if (build.ocrWorker) {
+        iframe.__pdfcraftOcrWorker = build.ocrWorker;
+        const modelsDir = (0, import_obsidian.normalizePath)(`${this.plugin.webRoot}/${version}/models`);
+        // Read only when OCR asks for a model (about 12 MB), and only plain file names from the models folder.
+        iframe.__pdfcraftReadModel = (name) => /^[\w.-]+$/.test(name) && !name.startsWith(".") ?
+          this.plugin.syncSafeAdapter.readBinary(`${modelsDir}/${name}`) : Promise.reject(new Error("Invalid model name."));
+      }
       if (this.startupOpen) {
         let prepared = bytes;
         iframe.__pdfcraftReadStartup = async () => {
@@ -1470,7 +1540,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
             prepared = null;
             return first;
           }
-          return this.app.vault.readBinary(file);
+          return this.plugin.readRetrying(() => this.app.vault.readBinary(file));
         };
       }
       const page = build.template.replace("<!--PDFCRAFT_HOOK-->", makeHook(this.plugin.settings.renderer, startupUrl));
@@ -1500,7 +1570,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
     } catch (e) {
       if (loadGeneration !== this.loadGeneration) return;
       console.error(e);
-      status.setText("Could not start PdfCraft: " + (e?.message || e));
+      status.setText("Could not start PdfCraft: " + (e?.message || e) + (e?.code === "ETIMEDOUT" ? ". The vault’s files may still be syncing (for example with Google Drive). Wait a moment, then reopen this PDF." : ""));
     }
   }
   async onUnloadFile(_file) {
@@ -1612,6 +1682,8 @@ var PdfCraftView = class extends import_obsidian.FileView {
     if (this.iframe) {
       delete this.iframe.__pdfcraftReadStartup;
       delete this.iframe.__pdfcraftModule;
+      delete this.iframe.__pdfcraftOcrWorker;
+      delete this.iframe.__pdfcraftReadModel;
       this.iframe.src = "about:blank";
       this.iframe.remove();
       this.iframe = null;
@@ -1758,7 +1830,7 @@ var PdfCraftView = class extends import_obsidian.FileView {
         status.remove();
         return;
       }
-      const bytes = this.startupOpen ? null : await this.app.vault.readBinary(file);
+      const bytes = this.startupOpen ? null : await this.plugin.readRetrying(() => this.app.vault.readBinary(file));
       if (!isCurrent()) {
         status.remove();
         return;
